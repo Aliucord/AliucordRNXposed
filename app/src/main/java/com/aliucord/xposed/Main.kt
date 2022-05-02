@@ -1,13 +1,17 @@
 package com.aliucord.xposed
 
 import android.annotation.SuppressLint
-import android.content.res.AssetManager
+import android.annotation.TargetApi
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.os.Build
+import dalvik.system.PathClassLoader
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
+import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.io.File
-import java.net.URL
 
 class InsteadHook(private val hook: (MethodHookParam) -> Any?) : XC_MethodHook() {
     override fun beforeHookedMethod(param: MethodHookParam) {
@@ -16,64 +20,83 @@ class InsteadHook(private val hook: (MethodHookParam) -> Any?) : XC_MethodHook()
 }
 
 class Main : IXposedHookLoadPackage {
+    @TargetApi(Build.VERSION_CODES.O)
     @SuppressLint("PrivateApi", "BlockedPrivateApi")
-    override fun handleLoadPackage(param: XC_LoadPackage.LoadPackageParam) {
-        if (param.packageName != "com.discord") return
+    override fun handleLoadPackage(loadPackageParam: XC_LoadPackage.LoadPackageParam) {
+        if (loadPackageParam.packageName != "com.discord") return
 
-        val doNothing = InsteadHook { null }
+        val moduleClassLoader = Main::class.java.classLoader
+        val moduleApk = moduleClassLoader.javaClass.declaredFields.first().apply { isAccessible = true }.get(moduleClassLoader) as String
 
         // disable updater
-        val bundleUpdater = param.classLoader.loadClass("com.discord.bundle_updater.BundleUpdater")
+        val bundleUpdater = loadPackageParam.classLoader.loadClass("com.discord.bundle_updater.BundleUpdater")
         XposedBridge.hookMethod(
             bundleUpdater.declaredMethods.find { m -> m.name == "checkForUpdate" },
-            doNothing
+            InsteadHook { null }
         )
 
-        val cache = File(param.appInfo.dataDir, "cache")
-        val modulesFile = File(cache, "modulesPatch.js")
-        if (!modulesFile.exists()) {
-            modulesFile.parentFile?.mkdirs()
-            modulesFile.writeText("""
-                const oldObjectCreate = this.Object.create;
-                const _window = this;
-                _window.Object.create = (...args) => {
-                    const obj = oldObjectCreate.apply(_window.Object, args);
-                    if (args[0] === null) {
-                        _window.modules = obj;
-                        _window.Object.create = oldObjectCreate;
-                    }
-                    return obj;
-                };
-            """.trimIndent())
+        // inject our native module
+        (loadPackageParam.classLoader as PathClassLoader).addDexPath("/sdcard/AliucordRN/AliucordNative.zip")
+
+        XposedHelpers.findAndHookMethod(
+            "com.discord.bridge.DCDReactNativeHost",
+            loadPackageParam.classLoader,
+            "getPackages",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    @Suppress("UNCHECKED_CAST") val packages = param.result as ArrayList<Any>
+                    packages.add(loadPackageParam.classLoader.loadClass("com.aliucord.AliucordNativePackage").getConstructor().newInstance())
+                }
+            }
+        )
+
+        XposedHelpers.findAndHookMethod(
+            "com.aliucord.AliucordNativeModule",
+            loadPackageParam.classLoader,
+            "checkPermissionsInternal",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    param.result = true
+                }
+            }
+        )
+
+        // enable cleartext traffic
+        XposedHelpers.findAndHookMethod(
+            "android.security.net.config.ManifestConfigSource",
+            loadPackageParam.classLoader,
+            "getConfigSource",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val mApplicationInfoField = XposedHelpers.findField(param.thisObject.javaClass, "mApplicationInfo")
+                    val applicationInfo = mApplicationInfoField.get(param.thisObject) as ApplicationInfo
+                    applicationInfo.flags = applicationInfo.flags or ApplicationInfo.FLAG_USES_CLEARTEXT_TRAFFIC
+                    mApplicationInfoField.set(param.thisObject, applicationInfo)
+                }
+            }
+        )
+
+        // inject libhermes.so
+        val soLoaderClass = loadPackageParam.classLoader.loadClass("com.facebook.soloader.SoLoader")
+
+        val addDirectApkSoSource = soLoaderClass.declaredMethods.find {
+            it.parameterCount == 2 && it.parameterTypes[0] == Context::class.java && it.parameterTypes[1] == ArrayList::class.java
         }
 
-        val urlFilter = param.classLoader.loadClass("com.android.okhttp.HttpHandler\$CleartextURLFilter")
-        val checkURLPermitted = urlFilter.getDeclaredMethod("checkURLPermitted", URL::class.java)
-        XposedBridge.hookMethod(checkURLPermitted, doNothing)
+        val directApkSoSource = loadPackageParam.classLoader.loadClass("com.facebook.soloader.c")
 
-        val catalystInstanceImpl = param.classLoader.loadClass("com.facebook.react.bridge.CatalystInstanceImpl")
-        val loadScriptFromAssets = catalystInstanceImpl.getDeclaredMethod(
-            "loadScriptFromAssets",
-            AssetManager::class.java,
-            String::class.java,
-            Boolean::class.javaPrimitiveType
+        XposedBridge.hookMethod(
+            addDirectApkSoSource,
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam?) {
+                    @Suppress("UNCHECKED_CAST") val soSources = param!!.args[1] as ArrayList<Any>
+
+                    val source = directApkSoSource.getDeclaredConstructor(File::class.java).apply { isAccessible = true }.newInstance(File(moduleApk))
+                    val mDirectApkLdPath = directApkSoSource.declaredFields.single { it.type == String::class.java }.apply { isAccessible = true }
+                    mDirectApkLdPath.set(source, "$moduleApk!/lib/" + Build.SUPPORTED_ABIS[0])
+                    soSources.add(0, source)
+                }
+            }
         )
-        val loadScriptFromFile = catalystInstanceImpl.getDeclaredMethod(
-            "jniLoadScriptFromFile",
-            String::class.java,
-            String::class.java,
-            Boolean::class.javaPrimitiveType
-        ).apply { isAccessible = true }
-        XposedBridge.hookMethod(loadScriptFromAssets, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) {
-                loadScriptFromFile.invoke(param.thisObject, modulesFile.absolutePath, modulesFile.absolutePath, param.args[2])
-            }
-
-            override fun afterHookedMethod(param: MethodHookParam) {
-                val aliucordFile = File(cache, "Aliucord.js")
-                aliucordFile.writeBytes(URL("http://localhost:3000/Aliucord.js").readBytes())
-                loadScriptFromFile.invoke(param.thisObject, aliucordFile.absolutePath, aliucordFile.absolutePath, param.args[2])
-            }
-        })
     }
 }

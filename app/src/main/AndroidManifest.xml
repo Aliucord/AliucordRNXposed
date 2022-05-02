@@ -11,12 +11,12 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="Shows version code and package name in app info." />
+            android:value="Aliu-es your discord apklessly" />
         <meta-data
             android:name="xposedminversion"
-            android:value="82" />
+            android:value="90" />
         <meta-data
             android:name="xposedscope"
-            android:value="@array/scope" />
+            android:value="com.discord" />
     </application>
 </manifest>
